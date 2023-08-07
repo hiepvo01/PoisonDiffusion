@@ -8,9 +8,27 @@ from utils import *
 from modules import UNet
 import logging
 from torch.utils.tensorboard import SummaryWriter
+import torchvision.models as models
+import itertools
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s: %(message)s", level=logging.INFO, datefmt="%I:%M:%S")
 
+class FeatureExtractor(nn.Module):
+    def __init__(self):
+        super(FeatureExtractor, self).__init__()
+        # Use a pretrained ResNet for feature extraction
+        self.resnet = models.resnet50(pretrained=True)
+        # Remove the last linear layer to get features
+        self.features = nn.Sequential(*list(self.resnet.children())[:-1])
+    
+    def forward(self, x):
+        return self.features(x)
+    
+def adversarial_loss(predicted, original, target_features, feature_extractor, alpha=0.5):
+    reconstruction_loss = ((predicted - original) ** 2).mean()
+    predicted_features = feature_extractor(predicted)
+    feature_loss = ((predicted_features - target_features) ** 2).mean()
+    return alpha * reconstruction_loss + (1 - alpha) * feature_loss
 
 class Diffusion:
     def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02, img_size=256, device="cuda"):
@@ -59,12 +77,15 @@ class Diffusion:
 
 
 def train(args):
-    # setup_logging(args.run_name)
+    setup_logging(args.run_name)
     device = args.device
-    dataloader = get_data(args)
+    dataloader, dataloader_target = get_data(args)
+    dataloader2_iter = itertools.cycle(dataloader_target)
+    
     model = UNet().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    mse = nn.MSELoss()
+    feature_extractor = FeatureExtractor().to(device)
+
     diffusion = Diffusion(img_size=args.image_size, device=device)
     logger = SummaryWriter(os.path.join("runs", args.run_name))
     l = len(dataloader)
@@ -72,12 +93,15 @@ def train(args):
     for epoch in range(args.epochs):
         logging.info(f"Starting epoch {epoch}:")
         pbar = tqdm(dataloader)
-        for i, (images, _) in enumerate(pbar):
+        pbar_target = tqdm(dataloader2_iter)
+        for i, (images, _), (images_target, _) in enumerate(zip(pbar, pbar_target)):
             images = images.to(device)
             t = diffusion.sample_timesteps(images.shape[0]).to(device)
             x_t, noise = diffusion.noise_images(images, t)
             predicted_noise = model(x_t, t)
-            loss = mse(noise, predicted_noise)
+            
+            target_features = feature_extractor(images_target).detach()
+            loss = adversarial_loss(predicted_noise, noise, target_features, feature_extractor)
 
             optimizer.zero_grad()
             loss.backward()
@@ -97,9 +121,9 @@ def launch():
     args = parser.parse_args()
     args.run_name = "DDPM_Uncondtional"
     args.epochs = 500
-    args.batch_size = 12
-    args.image_size = 64
-    args.dataset_path = r"C:\Users\dome\datasets\landscape_img_folder"
+    args.batch_size = 128
+    args.image_size = 32
+    args.dataset = "CIFAR10"
     args.device = "cuda"
     args.lr = 3e-4
     train(args)
